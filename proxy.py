@@ -3,12 +3,15 @@ import socket
 import threading
 import os
 import hashlib
+import time
 from urllib.parse import urlsplit
 
 HOST = "127.0.0.1"
 PORT = 8080
 
 CACHE_DIR = "cache"
+CACHE_TTL = 60  # Cache expires after 60 seconds
+
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 cache_lock = threading.Lock()
@@ -23,23 +26,42 @@ def get_cache_path(url):
     return os.path.join(CACHE_DIR, url_hash + ".cache")
 
 
-# Read response from cache
+# Read response from cache if it is still valid
 def read_cache(url):
     cache_path = get_cache_path(url)
 
     with cache_lock:
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, "rb") as file:
-                    return file.read()
-            except OSError as error:
-                print(f"Cache read error: {error}")
+        if not os.path.exists(cache_path):
+            return None
 
-    return None
+        try:
+            # Get the last modified time of the cache file
+            modified_time = os.path.getmtime(cache_path)
+
+            # Calculate how old the cached response is
+            cache_age = time.time() - modified_time
+
+            # Check whether the cache has expired
+            if cache_age >= CACHE_TTL:
+                os.remove(cache_path)
+                print("CACHE EXPIRED")
+                return None
+
+            # Cache is still valid, so read it
+            with open(cache_path, "rb") as file:
+                cached_response = file.read()
+
+            print(f"Cache age: {cache_age:.2f} seconds")
+            return cached_response
+
+        except OSError as error:
+            print(f"Cache read error: {error}")
+            return None
 
 
 # Save successful response to cache
 def save_cache(url, response):
+    # Check whether response is a valid HTTP response
     if not response.startswith(b"HTTP/"):
         return
 
@@ -48,15 +70,21 @@ def save_cache(url, response):
     if header_end == -1:
         return
 
+    # Extract response headers
     headers = response[:header_end].lower()
+
+    # Extract HTTP status line
     status_line = response.split(b"\r\n", 1)[0].split()
 
     # Cache only HTTP 200 responses
     if len(status_line) < 2 or status_line[1] != b"200":
         return
 
-    # Avoid caching responses that explicitly prohibit it
-    if b"no-store" in headers or b"private" in headers:
+    # Do not cache responses that prohibit storage
+    if (b"no-store" in headers or
+            b"private" in headers or
+            b"no-cache" in headers):
+        print("Response is not suitable for caching")
         return
 
     cache_path = get_cache_path(url)
@@ -64,30 +92,50 @@ def save_cache(url, response):
 
     with cache_lock:
         try:
+            # Write response to a temporary file first
             with open(temp_path, "wb") as file:
                 file.write(response)
 
+            # Replace old cache file safely
             os.replace(temp_path, cache_path)
+
             print("Response saved to cache")
 
         except OSError as error:
             print(f"Cache write error: {error}")
 
         finally:
+            # Remove temporary file if it still exists
             if os.path.exists(temp_path):
-                os.remove(temp_path)
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+
+# Send an HTTP error response to the client
+def send_error(client_socket, status, message):
+    response = (
+        f"HTTP/1.1 {status} {message}\r\n"
+        f"Content-Type: text/plain\r\n"
+        f"Content-Length: {len(message.encode('utf-8'))}\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+        f"{message}"
+    )
+
+    client_socket.sendall(response.encode("utf-8"))
 
 
 # Connect to destination server
 def connect_to_destination(host, port=80):
     try:
-        destination_socket = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_STREAM
+        destination_socket = socket.create_connection(
+            (host, port),
+            timeout=5
         )
 
-        destination_socket.settimeout(5)
-        destination_socket.connect((host, port))
+        destination_socket.settimeout(10)
 
         print(f"Connected to {host}:{port}")
 
@@ -131,21 +179,14 @@ def handle_client(client_socket, client_address):
 
         if len(parts) != 3:
             print("Malformed HTTP request")
-
-            client_socket.sendall(
-                b"HTTP/1.1 400 Bad Request\r\n"
-                b"Connection: close\r\n\r\n"
-            )
+            send_error(client_socket, 400, "Bad Request")
             return
 
         method, target, version = parts
 
         # This proxy currently supports GET only
         if method != "GET":
-            client_socket.sendall(
-                b"HTTP/1.1 501 Not Implemented\r\n"
-                b"Connection: close\r\n\r\n"
-            )
+            send_error(client_socket, 501, "Not Implemented")
             return
 
         # Read request headers
@@ -168,27 +209,30 @@ def handle_client(client_socket, client_address):
             host = url.hostname
 
             if not host:
-                client_socket.sendall(
-                    b"HTTP/1.1 400 Bad Request\r\n"
-                    b"Connection: close\r\n\r\n"
-                )
+                send_error(client_socket, 400, "Bad Request")
                 return
 
-            port = url.port or 80
+            try:
+                port = url.port or 80
+            except ValueError:
+                send_error(client_socket, 400, "Bad Request")
+                return
+
+            if url.scheme.lower() != "http":
+                send_error(client_socket, 400, "Bad Request")
+                return
+
             path = url.path or "/"
 
             if url.query:
                 path += "?" + url.query
 
         else:
+            # Handle origin-form request
             path = target
-            port = 80
 
             if not host:
-                client_socket.sendall(
-                    b"HTTP/1.1 400 Bad Request\r\n"
-                    b"Connection: close\r\n\r\n"
-                )
+                send_error(client_socket, 400, "Bad Request")
                 return
 
             try:
@@ -197,17 +241,11 @@ def handle_client(client_socket, client_address):
                 port = host_info.port or 80
 
             except ValueError:
-                client_socket.sendall(
-                    b"HTTP/1.1 400 Bad Request\r\n"
-                    b"Connection: close\r\n\r\n"
-                )
+                send_error(client_socket, 400, "Bad Request")
                 return
 
-            if not host:
-                client_socket.sendall(
-                    b"HTTP/1.1 400 Bad Request\r\n"
-                    b"Connection: close\r\n\r\n"
-                )
+            if not host or not path.startswith("/"):
+                send_error(client_socket, 400, "Bad Request")
                 return
 
         print("Method:", method)
@@ -232,24 +270,36 @@ def handle_client(client_socket, client_address):
         destination_socket = connect_to_destination(host, port)
 
         if destination_socket is None:
-            client_socket.sendall(
-                b"HTTP/1.1 502 Bad Gateway\r\n"
-                b"Connection: close\r\n\r\n"
-            )
+            send_error(client_socket, 502, "Bad Gateway")
             return
 
         # Build HTTP request for destination server
         new_request = f"{method} {path} {version}\r\n"
 
+        host_header_added = False
+
         for line in headers:
-            if line.lower().startswith("connection:"):
+            lower_line = line.lower()
+
+            # Remove proxy-specific connection headers
+            if lower_line.startswith("connection:"):
                 continue
 
-            if line.lower().startswith("proxy-connection:"):
+            if lower_line.startswith("proxy-connection:"):
+                continue
+
+            if lower_line.startswith("host:"):
+                new_request += f"Host: {host}\r\n"
+                host_header_added = True
                 continue
 
             new_request += line + "\r\n"
 
+        # Add Host header if missing
+        if not host_header_added:
+            new_request += f"Host: {host}\r\n"
+
+        # Ask destination to close connection after response
         new_request += "Connection: close\r\n\r\n"
 
         # Forward request to destination
@@ -259,7 +309,7 @@ def handle_client(client_socket, client_address):
 
         print("Request forwarded to destination")
 
-        # Receive complete response
+        # Receive complete response until server closes connection
         response_data = bytearray()
 
         while True:
@@ -272,23 +322,21 @@ def handle_client(client_socket, client_address):
 
         complete_response = bytes(response_data)
 
-        # Save response to file cache
+        # Save response if suitable for caching
         save_cache(cache_url, complete_response)
 
-        # Send response to client
+        # Send response back to client
         if complete_response:
             client_socket.sendall(complete_response)
-
-        print("Response forwarded to client")
+            print("Response forwarded to client")
+        else:
+            send_error(client_socket, 502, "Bad Gateway")
 
     except socket.timeout:
         print("Connection timed out")
 
         try:
-            client_socket.sendall(
-                b"HTTP/1.1 504 Gateway Timeout\r\n"
-                b"Connection: close\r\n\r\n"
-            )
+            send_error(client_socket, 504, "Gateway Timeout")
         except OSError:
             pass
 
@@ -320,7 +368,7 @@ server_socket.bind((HOST, PORT))
 server_socket.listen(5)
 
 print(f"Proxy server listening on {HOST}:{PORT}")
-
+print(f"Cache TTL: {CACHE_TTL} seconds")
 
 # Accept multiple clients using threads
 try:
