@@ -1,1 +1,2 @@
-example.com 
+# One domain per line. Lines beginning with # are comments.
+# Add a domain here to block it and its subdomains.
