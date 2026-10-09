@@ -1,6 +1,3 @@
-
-
-
 import socket
 import threading
 import os
@@ -14,92 +11,105 @@ PORT = 8080
 
 CACHE_DIR = "cache"
 CACHE_TTL = 60
+CACHE_MAX_ENTRIES = 100
+BLOCKED_DOMAINS_FILE = "blocked_domains.txt"
+LOG_FILE = "proxy.log"
+
+MAX_HEADER_SIZE = 16384
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-
-# Load blocked domains
-def load_blocked_domains():
-    blocked_domains = set()
-
-    try:
-        with open("blocked_domains.txt", "r") as file:
-            for line in file:
-                domain = line.strip().lower()
-
-                if domain:
-                    blocked_domains.add(domain)
-
-    except FileNotFoundError:
-        print("blocked_domains.txt not found")
-
-    return blocked_domains
-
-
-BLOCKED_DOMAINS = load_blocked_domains()
-
-
-# Create log file
 logging.basicConfig(
-    filename="proxy.log",
     level=logging.INFO,
-    format="%(asctime)s | %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
 )
 
-
-# Lock for cache access
 cache_lock = threading.Lock()
 
 
-# Generate a unique cache file for each URL
+# -------------------- CACHE FUNCTIONS --------------------
+
 def get_cache_path(url):
-    url_hash = hashlib.sha256(
-        url.encode("utf-8")
-    ).hexdigest()
-
-    return os.path.join(
-        CACHE_DIR,
-        url_hash + ".cache"
-    )
+    url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return os.path.join(CACHE_DIR, url_hash + ".cache")
 
 
-# Read response from cache
+def enforce_cache_limit():
+    current_time = time.time()
+    cache_files = []
+
+    try:
+        filenames = os.listdir(CACHE_DIR)
+    except OSError as error:
+        logging.error("Could not list cache directory: %s", error)
+        return
+
+    for filename in filenames:
+        if not filename.endswith(".cache"):
+            continue
+
+        path = os.path.join(CACHE_DIR, filename)
+
+        try:
+            file_info = os.stat(path)
+            age = current_time - file_info.st_mtime
+
+            if age >= CACHE_TTL:
+                os.remove(path)
+                logging.info("CACHE EXPIRED: %s", filename)
+            else:
+                cache_files.append((file_info.st_atime, path))
+
+        except OSError as error:
+            logging.warning("Cache cleanup error: %s", error)
+
+    # Least recently used files are removed first.
+    cache_files.sort(key=lambda item: item[0])
+
+    while len(cache_files) > CACHE_MAX_ENTRIES:
+        _, oldest_path = cache_files.pop(0)
+
+        try:
+            os.remove(oldest_path)
+            logging.info("LRU EVICTED: %s", os.path.basename(oldest_path))
+        except OSError as error:
+            logging.warning("LRU eviction error: %s", error)
+
+
 def read_cache(url):
     cache_path = get_cache_path(url)
 
     with cache_lock:
-
         if not os.path.exists(cache_path):
             return None
 
         try:
-            modified_time = os.path.getmtime(cache_path)
+            file_info = os.stat(cache_path)
+            modified_time = file_info.st_mtime
 
-            cache_age = time.time() - modified_time
-
-            if cache_age >= CACHE_TTL:
+            if time.time() - modified_time >= CACHE_TTL:
                 os.remove(cache_path)
-
-                print("CACHE EXPIRED")
-
+                logging.info("CACHE EXPIRED")
                 return None
 
             with open(cache_path, "rb") as file:
-                cached_response = file.read()
+                response = file.read()
 
-            print(f"Cache age: {cache_age:.2f} seconds")
+            # Update access time without changing TTL.
+            os.utime(cache_path, (time.time(), modified_time))
 
-            return cached_response
+            return response
 
         except OSError as error:
-            print(f"Cache read error: {error}")
-
+            logging.error("Cache read error: %s", error)
             return None
 
 
-# Save response to cache
 def save_cache(url, response):
-
     if not response.startswith(b"HTTP/"):
         return
 
@@ -109,82 +119,132 @@ def save_cache(url, response):
         return
 
     headers = response[:header_end].lower()
+    status_line = response.split(b"\r\n", 1)[0].split()
 
-    status_line = response.split(
-        b"\r\n",
-        1
-    )[0].split()
-
-    # Cache only HTTP 200 responses
+    # Cache only HTTP 200 responses.
     if len(status_line) < 2 or status_line[1] != b"200":
         return
 
-    # Do not cache these responses
+    # Do not cache private or non-cacheable responses.
     if (
         b"no-store" in headers
         or b"private" in headers
         or b"no-cache" in headers
+        or b"set-cookie:" in headers
+        or b"vary: *" in headers
     ):
-        print("Response is not suitable for caching")
-
+        logging.info("Response is not suitable for caching")
         return
 
     cache_path = get_cache_path(url)
-
     temp_path = cache_path + ".tmp"
 
     with cache_lock:
-
         try:
-
             with open(temp_path, "wb") as file:
                 file.write(response)
 
-            os.replace(
-                temp_path,
-                cache_path
-            )
+            os.replace(temp_path, cache_path)
+            enforce_cache_limit()
 
-            print("Response saved to cache")
+            logging.info("Response saved to cache")
 
         except OSError as error:
-
-            print(f"Cache write error: {error}")
+            logging.error("Cache write error: %s", error)
 
         finally:
-
             if os.path.exists(temp_path):
-
                 try:
                     os.remove(temp_path)
-
                 except OSError:
                     pass
 
 
-# Send an HTTP error response
+# -------------------- DOMAIN BLOCKING --------------------
+
+def load_blocked_domains():
+    blocked = set()
+
+    if not os.path.exists(BLOCKED_DOMAINS_FILE):
+        try:
+            with open(BLOCKED_DOMAINS_FILE, "w", encoding="utf-8") as file:
+                file.write(
+                    "# Add one domain per line.\n"
+                    "# Example: example.com\n"
+                )
+        except OSError as error:
+            logging.error("Could not create blocklist: %s", error)
+
+        return blocked
+
+    try:
+        with open(BLOCKED_DOMAINS_FILE, "r", encoding="utf-8") as file:
+            for line in file:
+                domain = line.strip().lower()
+
+                if domain and not domain.startswith("#"):
+                    blocked.add(domain.lstrip("."))
+
+    except OSError as error:
+        logging.error("Could not read blocklist: %s", error)
+
+    return blocked
+
+
+def is_blocked(host):
+    host = (host or "").lower().rstrip(".")
+
+    for domain in load_blocked_domains():
+        if host == domain or host.endswith("." + domain):
+            return True
+
+    return False
+
+
+# -------------------- HTTP HELPERS --------------------
+
 def send_error(client_socket, status, message):
+    body = message.encode("utf-8")
 
     response = (
         f"HTTP/1.1 {status} {message}\r\n"
-        f"Content-Type: text/plain\r\n"
-        f"Content-Length: "
-        f"{len(message.encode('utf-8'))}\r\n"
-        f"Connection: close\r\n"
-        f"\r\n"
-        f"{message}"
-    )
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("latin-1") + body
 
-    client_socket.sendall(
-        response.encode("utf-8")
-    )
+    client_socket.sendall(response)
 
 
-# Connect to destination server
+def receive_request(client_socket):
+    """Receive the complete HTTP header or reject oversized headers."""
+    data = bytearray()
+
+    while b"\r\n\r\n" not in data:
+        remaining = MAX_HEADER_SIZE - len(data)
+
+        if remaining <= 0:
+            raise ValueError("Request headers too large")
+
+        chunk = client_socket.recv(min(4096, remaining))
+
+        if not chunk:
+            break
+
+        data.extend(chunk)
+
+    if len(data) >= MAX_HEADER_SIZE and b"\r\n\r\n" not in data:
+        raise ValueError("Request headers too large")
+
+    if b"\r\n\r\n" not in data:
+        raise ValueError("Incomplete HTTP request")
+
+    return bytes(data)
+
+
 def connect_to_destination(host, port=80):
-
     try:
-
         destination_socket = socket.create_connection(
             (host, port),
             timeout=5
@@ -192,557 +252,346 @@ def connect_to_destination(host, port=80):
 
         destination_socket.settimeout(10)
 
-        print(
-            f"Connected to {host}:{port}"
-        )
+        logging.info("Connected to destination %s:%s", host, port)
 
         return destination_socket
 
     except socket.timeout:
-
-        print("Connection timed out")
+        logging.warning("Connection timed out: %s:%s", host, port)
 
     except socket.gaierror:
-
-        print(
-            "Could not find the destination server"
-        )
+        logging.warning("Could not resolve host: %s", host)
 
     except OSError as error:
-
-        print(
-            f"Connection failed: {error}"
+        logging.warning(
+            "Connection failed to %s:%s: %s",
+            host, port, error
         )
 
     return None
 
 
-# Handle each client
-def handle_client(
-    client_socket,
-    client_address
-):
+# -------------------- CLIENT HANDLER --------------------
 
+def handle_client(client_socket, client_address):
     destination_socket = None
-
     start_time = time.time()
 
-    try:
+    request_url = "-"
+    status_for_log = "unknown"
+    cache_state = "not checked"
 
-        print(
-            f"\nClient connected: "
-            f"{client_address}"
-        )
+    try:
+        logging.info("Client connected: %s", client_address)
 
         client_socket.settimeout(10)
 
-        # Receive HTTP request
-        request = client_socket.recv(4096)
-
-        if not request:
+        # Receive the full HTTP header.
+        try:
+            request_bytes = receive_request(client_socket)
+        except ValueError as error:
+            send_error(client_socket, 431, "Request Header Fields Too Large")
+            status_for_log = 431
+            logging.warning("%s from %s", error, client_address)
             return
 
-        request = request.decode(
-            "latin-1"
-        )
+        if not request_bytes:
+            return
 
-        print("HTTP Request:")
-        print(request)
+        header_end = request_bytes.find(b"\r\n\r\n")
+        header_bytes = request_bytes[:header_end]
+        request = header_bytes.decode("latin-1")
 
-        # Parse request
         lines = request.split("\r\n")
-
         parts = lines[0].split()
 
         if len(parts) != 3:
-
-            print("Malformed HTTP request")
-
-            send_error(
-                client_socket,
-                400,
-                "Bad Request"
-            )
-
+            send_error(client_socket, 400, "Bad Request")
+            status_for_log = 400
             return
 
-        method = parts[0]
+        method, target, version = parts
 
-        target = parts[1]
-
-        version = parts[2]
-
-        # Only GET supported
-        if method != "GET":
-
-            send_error(
-                client_socket,
-                501,
-                "Not Implemented"
-            )
-
+        # This proxy supports GET requests only.
+        if method.upper() != "GET":
+            send_error(client_socket, 501, "Not Implemented")
+            status_for_log = 501
             return
 
-        # Read headers
-        host = ""
+        if version not in ("HTTP/1.0", "HTTP/1.1"):
+            send_error(client_socket, 400, "Bad Request")
+            status_for_log = 400
+            return
 
         headers = []
+        host_header = ""
 
         for line in lines[1:]:
-
             if not line:
                 break
 
-            if line.lower().startswith(
-                "host:"
-            ):
-
-                host = line.split(
-                    ":",
-                    1
-                )[1].strip()
+            if line.lower().startswith("host:"):
+                host_header = line.split(":", 1)[1].strip()
 
             headers.append(line)
 
-        # Parse absolute URL
-        if target.startswith("http://"):
-
-            url = urlsplit(target)
-
-            host = url.hostname
-
-            if not host:
-
-                send_error(
-                    client_socket,
-                    400,
-                    "Bad Request"
-                )
-
-                return
-
+        # Parse the URL.
+        if target.lower().startswith("http://"):
             try:
+                url = urlsplit(target)
 
+                if url.scheme.lower() != "http" or not url.hostname:
+                    raise ValueError("Invalid URL")
+
+                host = url.hostname
                 port = url.port or 80
 
+                path = url.path or "/"
+
+                if url.query:
+                    path += "?" + url.query
+
             except ValueError:
-
-                send_error(
-                    client_socket,
-                    400,
-                    "Bad Request"
-                )
-
+                send_error(client_socket, 400, "Bad Request")
+                status_for_log = 400
                 return
 
-            if url.scheme.lower() != "http":
-
-                send_error(
-                    client_socket,
-                    400,
-                    "Bad Request"
-                )
-
-                return
-
-            path = url.path or "/"
-
-            if url.query:
-
-                path += "?" + url.query
-
-        # Parse origin-form request
         else:
-
+            # Handle requests such as GET /index.html HTTP/1.1.
             path = target
 
-            if not host:
-
-                send_error(
-                    client_socket,
-                    400,
-                    "Bad Request"
-                )
-
+            if not host_header:
+                send_error(client_socket, 400, "Bad Request")
+                status_for_log = 400
                 return
 
             try:
-
-                host_info = urlsplit(
-                    "//" + host
-                )
+                host_info = urlsplit("//" + host_header)
 
                 host = host_info.hostname
-
                 port = host_info.port or 80
 
             except ValueError:
-
-                send_error(
-                    client_socket,
-                    400,
-                    "Bad Request"
-                )
-
+                send_error(client_socket, 400, "Bad Request")
+                status_for_log = 400
                 return
 
             if not host or not path.startswith("/"):
-
-                send_error(
-                    client_socket,
-                    400,
-                    "Bad Request"
-                )
-
+                send_error(client_socket, 400, "Bad Request")
+                status_for_log = 400
                 return
 
-        print("Method:", method)
+        host = host.lower().rstrip(".")
 
-        print("Host:", host)
-
-        print("Path:", path)
-
-
-        # -------------------------
-        # DAY 11: DOMAIN BLOCKING
-        # -------------------------
-
-        if host.lower() in BLOCKED_DOMAINS:
-
-            print(
-                "BLOCKED:",
-                host
-            )
-
-            logging.info(
-                f"client={client_address[0]} | "
-                f"method={method} | "
-                f"url=http://{host}{path} | "
-                f"status=403 | "
-                f"cache=BLOCKED"
-            )
-
-            send_error(
-                client_socket,
-                403,
-                "Forbidden"
-            )
-
-            return
-
-
-        # Create cache URL
-        cache_url = (
-            f"http://"
-            f"{host.lower()}:"
-            f"{port}"
-            f"{path}"
-        )
-
-
-        # -------------------------
-        # DAY 10: CACHE CHECK
-        # -------------------------
-
-        cached_response = read_cache(
-            cache_url
-        )
-
-        if cached_response is not None:
-
-            print("CACHE HIT")
-
-            logging.info(
-                f"client={client_address[0]} | "
-                f"method={method} | "
-                f"url={cache_url} | "
-                f"status=200 | "
-                f"cache=HIT"
-            )
-
-            client_socket.sendall(
-                cached_response
-            )
-
-            return
-
-
-        print("CACHE MISS")
+        # Include the port when it is not the default HTTP port.
+        if port == 80:
+            request_url = f"http://{host}{path}"
+        else:
+            request_url = f"http://{host}:{port}{path}"
 
         logging.info(
-            f"client={client_address[0]} | "
-            f"method={method} | "
-            f"url={cache_url} | "
-            f"cache=MISS"
+            "Method: %s | Host: %s | Path: %s",
+            method, host, path
         )
 
+        # Check domain blocking before checking the cache.
+        if is_blocked(host):
+            logging.warning("BLOCKED domain: %s", host)
 
-        # Connect to destination
-        destination_socket = (
-            connect_to_destination(
-                host,
-                port
-            )
-        )
+            send_error(client_socket, 403, "Forbidden")
+            status_for_log = 403
+            return
 
-        if destination_socket is None:
+        # Check cache.
+        cached_response = read_cache(request_url)
 
-            send_error(
-                client_socket,
-                502,
-                "Bad Gateway"
-            )
+        if cached_response is not None:
+            cache_state = "HIT"
 
-            logging.info(
-                f"client={client_address[0]} | "
-                f"method={method} | "
-                f"url={cache_url} | "
-                f"status=502"
-            )
+            logging.info("CACHE HIT: %s", request_url)
+
+            client_socket.sendall(cached_response)
+
+            try:
+                status_for_log = (
+                    cached_response.split(b"\r\n", 1)[0]
+                    .split()[1].decode("ascii")
+                )
+            except (IndexError, UnicodeDecodeError):
+                status_for_log = "cached"
 
             return
 
+        cache_state = "MISS"
 
-        # Create request for destination
-        new_request = (
-            f"{method} "
-            f"{path} "
-            f"{version}\r\n"
-        )
+        logging.info("CACHE MISS: %s", request_url)
 
-        host_header_added = False
+        # Connect to the destination.
+        destination_socket = connect_to_destination(host, port)
 
+        if destination_socket is None:
+            send_error(client_socket, 502, "Bad Gateway")
+            status_for_log = 502
+            return
+
+        # Forward the request to the destination.
+        new_request = f"{method} {path} {version}\r\n"
+
+        host_value = host if port == 80 else f"{host}:{port}"
+        new_request += f"Host: {host_value}\r\n"
 
         for line in headers:
-
             lower_line = line.lower()
 
-            # Remove connection header
-            if lower_line.startswith(
-                "connection:"
-            ):
+            if lower_line.startswith("host:"):
                 continue
 
-            # Remove proxy connection header
-            if lower_line.startswith(
-                "proxy-connection:"
-            ):
+            if lower_line.startswith("connection:"):
                 continue
 
-            # Replace Host header
-            if lower_line.startswith(
-                "host:"
-            ):
-
-                new_request += (
-                    f"Host: {host}\r\n"
-                )
-
-                host_header_added = True
-
+            if lower_line.startswith("proxy-connection:"):
                 continue
 
-            new_request += (
-                line + "\r\n"
-            )
+            new_request += line + "\r\n"
 
+        new_request += "Connection: close\r\n\r\n"
 
-        # Add Host header if missing
-        if not host_header_added:
+        destination_socket.sendall(new_request.encode("latin-1"))
 
-            new_request += (
-                f"Host: {host}\r\n"
-            )
+        logging.info("Request forwarded to destination")
 
-
-        # Close connection after response
-        new_request += (
-            "Connection: close\r\n"
-            "\r\n"
-        )
-
-
-        # Forward request
-        destination_socket.sendall(
-            new_request.encode(
-                "latin-1"
-            )
-        )
-
-        print(
-            "Request forwarded "
-            "to destination"
-        )
-
-
-        # Receive response
+        # Receive the destination response.
         response_data = bytearray()
 
         while True:
-
-            response = (
-                destination_socket.recv(
-                    4096
-                )
-            )
-
-            if not response:
+            try:
+                chunk = destination_socket.recv(4096)
+            except socket.timeout:
+                logging.warning("Destination response timed out")
                 break
 
-            response_data.extend(
-                response
-            )
+            if not chunk:
+                break
 
+            response_data.extend(chunk)
 
-        complete_response = bytes(
-            response_data
-        )
+        complete_response = bytes(response_data)
 
+        if not complete_response:
+            send_error(client_socket, 502, "Bad Gateway")
+            status_for_log = 502
+            return
 
-        # Save response to cache
-        save_cache(
-            cache_url,
-            complete_response
-        )
+        # Cache suitable responses and return the response to the client.
+        save_cache(request_url, complete_response)
 
+        client_socket.sendall(complete_response)
 
-        # Send response to client
-        if complete_response:
-
-            client_socket.sendall(
-                complete_response
-            )
-
-            print(
-                "Response forwarded "
-                "to client"
-            )
-
-            response_time = (
-                time.time() - start_time
-            )
-
-            logging.info(
-                f"client={client_address[0]} | "
-                f"method={method} | "
-                f"url={cache_url} | "
-                f"status=200 | "
-                f"cache=MISS | "
-                f"response_time="
-                f"{response_time:.4f}s"
-            )
-
-        else:
-
-            send_error(
-                client_socket,
-                502,
-                "Bad Gateway"
-            )
-
-
-    except socket.timeout:
-
-        print(
-            "Connection timed out"
-        )
+        logging.info("Response forwarded to client")
 
         try:
-
-            send_error(
-                client_socket,
-                504,
-                "Gateway Timeout"
+            status_for_log = (
+                complete_response.split(b"\r\n", 1)[0]
+                .split()[1].decode("ascii")
             )
+        except (IndexError, UnicodeDecodeError):
+            status_for_log = "unknown"
 
+    except socket.timeout:
+        logging.warning("Client request timed out: %s", client_address)
+
+        status_for_log = 504
+
+        try:
+            send_error(client_socket, 504, "Gateway Timeout")
         except OSError:
             pass
 
-
     except OSError as error:
-
-        print(
-            f"Error: {error}"
+        logging.error(
+            "Error handling client %s: %s",
+            client_address, error
         )
 
+        status_for_log = "connection error"
+
+        try:
+            send_error(client_socket, 502, "Bad Gateway")
+        except OSError:
+            pass
 
     finally:
+        if destination_socket is not None:
+            try:
+                destination_socket.close()
+            except OSError:
+                pass
 
-        if destination_socket:
+        try:
+            client_socket.close()
+        except OSError:
+            pass
 
-            destination_socket.close()
+        elapsed = time.time() - start_time
 
-        client_socket.close()
-
-        print(
-            f"Client disconnected: "
-            f"{client_address}"
+        logging.info(
+            "Client disconnected: %s | URL: %s | Status: %s | "
+            "Cache: %s | Time: %.3fs",
+            client_address,
+            request_url,
+            status_for_log,
+            cache_state,
+            elapsed
         )
 
 
-# -------------------------
-# CREATE PROXY SERVER
-# -------------------------
+# -------------------- START PROXY SERVER --------------------
 
-server_socket = socket.socket(
-    socket.AF_INET,
-    socket.SOCK_STREAM
-)
-
-server_socket.setsockopt(
-    socket.SOL_SOCKET,
-    socket.SO_REUSEADDR,
-    1
-)
-
-server_socket.bind(
-    (HOST, PORT)
-)
-
-server_socket.listen(5)
-
-print(
-    f"Proxy server listening "
-    f"on {HOST}:{PORT}"
-)
-
-print(
-    f"Cache TTL: "
-    f"{CACHE_TTL} seconds"
-)
-
-
-# -------------------------
-# DAY 8: MULTIPLE CLIENTS
-# -------------------------
-
-try:
-
-    while True:
-
-        client_socket, client_address = (
-            server_socket.accept()
-        )
-
-        client_thread = threading.Thread(
-            target=handle_client,
-            args=(
-                client_socket,
-                client_address
-            )
-        )
-
-        client_thread.start()
-
-
-except KeyboardInterrupt:
-
-    print(
-        "\nProxy server shutting down"
+def main():
+    server_socket = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_STREAM
     )
 
+    server_socket.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_REUSEADDR,
+        1
+    )
 
-finally:
+    try:
+        server_socket.bind((HOST, PORT))
+        server_socket.listen(50)
 
-    server_socket.close()
+        logging.info(
+            "Proxy server listening on %s:%s",
+            HOST, PORT
+        )
 
+        logging.info("Cache TTL: %s seconds", CACHE_TTL)
+        logging.info("Maximum cache entries: %s", CACHE_MAX_ENTRIES)
+        logging.info("Blocked domains file: %s", BLOCKED_DOMAINS_FILE)
+
+        while True:
+            client_socket, client_address = server_socket.accept()
+
+            client_thread = threading.Thread(
+                target=handle_client,
+                args=(client_socket, client_address),
+                daemon=True
+            )
+
+            client_thread.start()
+
+    except KeyboardInterrupt:
+        logging.info("Proxy server shutting down")
+
+    except OSError as error:
+        logging.error("Proxy server error: %s", error)
+
+    finally:
+        server_socket.close()
+
+
+if __name__ == "__main__":
+    main()
