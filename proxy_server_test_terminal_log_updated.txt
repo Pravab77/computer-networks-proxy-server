@@ -1,0 +1,237 @@
+COMPUTER NETWORKS MINI PROJECT
+DESIGNING A PROXY SERVER
+TEST-WISE TERMINAL INPUTS, OUTPUTS, AND RESULTS
+
+Note:
+This file combines the test descriptions and results shared in the conversation with the available terminal commands and outputs. Some entries are report-style summaries rather than verbatim terminal transcripts. Test 4 appeared twice in the supplied text; both versions are retained below for completeness, with the updated version including the concurrent-launch check.
+
+============================================================
+TEST 1: BASIC HTTP FORWARDING
+============================================================
+
+Objective:
+To verify that the proxy server forwards HTTP requests and returns responses to the client.
+
+Procedure:
+1. Started the proxy server using:
+   py proxy.py
+2. Ran the client using:
+   py client.py
+   in a separate terminal.
+3. Observed the HTTP response received by the client.
+
+Command:
+py client.py
+
+Observed output (relevant portion):
+HTTP/1.1 200 OK
+Date: Sat, 10 Oct 2026 18:39:54 GMT
+Content-Type: text/html; charset=utf-8
+...
+<!doctype html>...
+<title>Example Domain</title>...
+
+Expected Result:
+The client should receive a valid HTTP response from the destination server.
+
+Actual Result:
+The client received HTTP/1.1 200 OK along with HTTP headers and HTML webpage content.
+
+Conclusion:
+Test 1 passed. Basic HTTP forwarding was successful.
+
+Additional note:
+An earlier attempt returned HTTP 403 because example.com was in the blocklist. After allowing the domain, the client received HTTP 200 OK.
+
+============================================================
+TEST 2: CACHE HIT/MISS VERIFICATION
+============================================================
+
+Objective:
+To verify that the HTTP forward proxy caches eligible responses and reuses them for repeated requests.
+
+Procedure:
+Sent repeated GET requests to http://httpbin.org/get through the proxy at 127.0.0.1:8080.
+
+Command:
+curl.exe -i -x http://127.0.0.1:8080 http://httpbin.org/get
+
+Results:
+- The initial request produced a cache MISS and fetched the response from the origin server.
+- The response was saved in the proxy cache.
+- A subsequent request produced a cache HIT and returned the cached response with HTTP status 200.
+- The response time recorded in the report text supplied later was 2.672 seconds for the MISS and 0.030 seconds for the HIT.
+
+Additional cache timing evidence from a separate example.com run:
+Command:
+curl.exe -s -o NUL -w "Time: %{time_total}s`n" -x http://127.0.0.1:8080 http://example.com/
+
+First request output:
+Time: 0.228781s
+
+Second request output:
+Time: 0.022731s
+
+Relevant proxy log entries:
+2026-10-11 00:20:16 ... CACHE EXPIRED
+CACHE MISS: http://example.com/
+... Connected to destination example.com:80
+... Response saved to cache
+... Status: 200 | Cache: MISS | Time: 0.227s
+
+2026-10-11 00:20:31 ... CACHE HIT: http://example.com/
+... Status: 200 | Cache: HIT | Time: 0.021s
+
+Conclusion:
+The test passed. The proxy successfully cached and reused an eligible HTTP response, reducing response time for the tested request.
+
+Note:
+The httpbin.org timing and example.com timing are separate recorded runs; they should not be mixed as if they came from one test run. In a later attempt, httpbin.org failed DNS resolution, so that failed attempt is not used as evidence of the successful cache test.
+
+============================================================
+TEST 3: DOMAIN BLOCKING
+============================================================
+
+Objective:
+To verify that the proxy server blocks access to domains listed in blocked_domains.txt.
+
+Procedure:
+1. Added example.com to the domain blocklist.
+2. Started the proxy server.
+3. Sent an HTTP request using curl.exe through the proxy to http://example.com/.
+4. Observed the HTTP response.
+
+Command:
+curl.exe -i -x http://127.0.0.1:8080 http://example.com/
+
+Expected Result:
+The proxy should reject requests to blocked domains.
+
+Actual Result:
+HTTP/1.1 403 Forbidden
+
+Conclusion:
+Test 3 passed. The proxy successfully denied access to the blocked domain.
+
+Additional note:
+When example.com was removed from the blocklist or allowed again, the request returned HTTP 200 OK.
+
+============================================================
+TEST 4 (EARLIER VERSION): MULTIPLE CLIENTS AND ERROR HANDLING
+============================================================
+
+Objective:
+To verify that the proxy handles multiple client requests and responds appropriately to connection failures and malformed requests.
+
+Procedure:
+1. Sent HTTP requests from two client terminals.
+2. Tested an unreachable destination using http://127.0.0.1:1/.
+3. Sent a malformed request (BADREQUEST) directly to the proxy.
+
+Results:
+- Both client requests to the allowed destination returned HTTP 200 OK.
+- The unreachable destination returned HTTP 502 Bad Gateway.
+- The malformed request returned HTTP 400 Bad Request.
+
+Conclusion:
+The proxy successfully handled the tested requests and returned appropriate HTTP error responses for the unreachable destination and malformed request. Concurrent execution should be confirmed separately before claiming that concurrent handling was verified.
+
+============================================================
+TEST 4 (UPDATED VERSION): MULTIPLE CLIENTS AND ERROR HANDLING
+============================================================
+
+Objective:
+To verify that the proxy handles multiple client requests and responds appropriately to connection failures and malformed requests.
+
+Procedure:
+1. Sent HTTP requests from two client terminals.
+2. Launched two HTTP requests concurrently using PowerShell background jobs, with different query parameters.
+3. Tested an unreachable destination using http://127.0.0.1:1/.
+4. Sent a malformed request (BADREQUEST) directly to the proxy.
+
+PowerShell commands for concurrent-launch check:
+$j1 = Start-Job { curl.exe -s -o NUL -w "Client 1: %{http_code} | %{time_total}s`n" -x http://127.0.0.1:8080 "http://example.com/?client=1" }
+$j2 = Start-Job { curl.exe -s -o NUL -w "Client 2: %{http_code} | %{time_total}s`n" -x http://127.0.0.1:8080 "http://example.com/?client=2" }
+Wait-Job $j1, $j2
+Receive-Job $j1, $j2
+Remove-Job $j1, $j2
+
+Observed background-job output:
+Id     Name            PSJobTypeName   State         HasMoreData     Location             Command
+--     ----            -------------   -----         -----------     --------             -------
+1      Job1            BackgroundJob   Completed     True            localhost             curl.exe -s -o NU...
+3      Job3            BackgroundJob   Completed     True            localhost             curl.exe -s -o NU...
+Client 1: 200 | 0.592061s
+Client 2: 200 | 0.532414s
+
+Other observed results:
+- Both initial client requests to the allowed destination returned HTTP 200 OK.
+- Unreachable destination command:
+  curl.exe --max-time 15 -i -x http://127.0.0.1:8080 http://127.0.0.1:1/
+  Output: HTTP/1.1 502 Bad Gateway
+  Proxy log detail: connection refused (WinError 10061); status 502.
+- Malformed request command:
+  py -c "import socket; s=socket.create_connection(('127.0.0.1',8080)); s.sendall(b'BADREQUEST\r\n\r\n'); print(s.recv(4096).decode(errors='replace')); s.close()"
+  Output: HTTP/1.1 400 Bad Request
+
+Conclusion:
+The proxy successfully handled the tested client requests and returned appropriate HTTP error responses for the unreachable destination and malformed request. The simultaneous launch of two requests supports multi-client testing, although the results alone do not conclusively establish simultaneous processing within the proxy server.
+
+============================================================
+TEST 5: PERFORMANCE TESTING
+============================================================
+
+Objective:
+To compare the response time for a cache MISS and a subsequent cache HIT.
+
+Command:
+curl.exe -s -o NUL -w "Time: %{time_total}s`n" -x http://127.0.0.1:8080 http://example.com/
+
+First request output:
+Time: 0.228781s
+
+Second request output:
+Time: 0.022731s
+
+Relevant proxy log entries:
+2026-10-11 00:20:16 ... CACHE EXPIRED
+CACHE MISS: http://example.com/
+... Connected to destination example.com:80
+... Response saved to cache
+... Status: 200 | Cache: MISS | Time: 0.227s
+
+2026-10-11 00:20:31 ... CACHE HIT: http://example.com/
+... Status: 200 | Cache: HIT | Time: 0.021s
+
+Results based on proxy log times:
+- Cache MISS: 0.227 seconds
+- Cache HIT: 0.021 seconds
+- Time saved: 0.206 seconds
+- Approximate latency reduction: 90.7%
+- Cache-hit response was approximately 10.8 times faster than the cache-miss response.
+
+Conclusion:
+Test 5 passed. The repeated request was served from cache and completed much faster than the cache-miss request.
+
+============================================================
+OVERALL TEST SUMMARY
+============================================================
+
+Test 1 - Basic HTTP Forwarding:
+PASS. The request returned HTTP 200 OK and Example Domain HTML content.
+
+Test 2 - Cache HIT/MISS:
+PASS. The supplied report text records a MISS at 2.672 seconds and a HIT at 0.030 seconds for http://httpbin.org/get. A separate example.com run recorded a MISS at 0.227 seconds and a HIT at 0.021 seconds in proxy logs.
+
+Test 3 - Domain Blocking:
+PASS. A blocked domain returned HTTP 403 Forbidden.
+
+Test 4 - Multiple Clients and Error Handling:
+PASS for successful client requests and error handling. The unreachable destination returned HTTP 502 Bad Gateway; the malformed request returned HTTP 400 Bad Request. Two background-job requests both returned HTTP 200 OK. The client results support multi-client testing but do not conclusively prove simultaneous processing inside the proxy.
+
+Test 5 - Performance Testing:
+PASS. Proxy logs recorded 0.227 seconds for cache MISS and 0.021 seconds for cache HIT in the example.com performance run.
+
+============================================================
+END OF FILE
+============================================================
