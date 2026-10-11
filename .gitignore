@@ -1,0 +1,5 @@
+__pycache__/
+cache/
+proxy.log
+proxy_*_backup.py
+blocked_domains_*_backup.txt
