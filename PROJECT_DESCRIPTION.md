@@ -1,51 +1,35 @@
-Computer Networks Mini Project
-Designing a Proxy Server
-Project Overview
+# Project Description: Designing a Proxy Server
 
-The project is to design and implement a forward proxy server that acts as an intermediary between a client and a destination web server. The proxy will receive requests from clients, process and inspect the requests, and forward allowed requests to the intended destination server. It will then receive the response from the destination server and send it back to the client.
+## Objective
+Build a working forward proxy for a Computer Networks mini-project. The proxy receives client HTTP requests, validates them, enforces domain-based access control, optionally reuses a fresh cached response, forwards cache misses to the origin server, and logs the outcome. It handles multiple clients with a thread-per-client model.
 
-The proxy will primarily handle HTTP requests using TCP sockets.
+## Architecture
 
-Main Objectives
+`Client → TCP listener → request parser/validator → domain blocklist → cache lookup → origin connection on miss → response framing → client`
 
-The main objectives of the project are:
+HTTPS clients use `CONNECT`; after an allowed tunnel is established, encrypted bytes are relayed without TLS decryption.
 
-Understand the working and structure of HTTP requests and responses.
-Understand the difference between forward and reverse proxies.
-Implement a forward proxy that can receive and forward HTTP requests.
-Handle multiple clients simultaneously.
-Implement caching to avoid repeatedly fetching the same resources.
-Implement an access-control feature to block selected domains or URLs.
-Maintain useful logs of proxy activity.
-Handle malformed requests and unreachable destination servers gracefully.
-Measure the performance overhead introduced by the proxy compared with a direct connection.
-Planned Architecture
+## Design choices
 
-The basic communication flow will be:
+- **Language/networking:** Python 3 standard library, TCP sockets, and threads.
+- **Cache:** in-memory `OrderedDict` with a lock. The mapping key is `(canonical_url, accept_encoding)`. `get()` counts a valid fresh entry as a hit; a missing or expired entry counts as a miss. Successful lookups update recency. The oldest entry is evicted at capacity.
+- **Freshness:** TTL uses origin `s-maxage`/`max-age` or `Expires` when available, capped by the configured 60-second default. `Age` is deducted from max-age. Expired entries are never served.
+- **Cache safety:** cache only complete HTTP 200 GET responses that meet a conservative policy. Bypass requests with cookies/authorization and avoid storing private/no-store/no-cache/set-cookie or unsupported Vary responses.
+- **Access control:** `blocked_domains.txt` blocks a domain and its subdomains, returning HTTP 403.
+- **Protocol/error handling:** HTTP request headers are size-limited, Content-Length bodies are bounded, unsupported chunked uploads are explicitly rejected, and origin responses are read using Content-Length, chunked framing, or connection-close framing. Truncated framed responses are not cached. DNS/connect/timeout failures are logged and mapped to HTTP error responses where possible.
+- **Logging:** request method, destination, HTTP status, cache state, elapsed time, block events, cache storage, and cache statistics are logged.
+- **Performance measurement:** direct and proxied requests use the same URL and `Cache-Control: no-cache`, separating proxy overhead from cache-hit speedups. A distinct warm-cache check demonstrates caching where the origin allows it.
 
-Client → Forward Proxy → Destination Server
+## Scope limitations
 
-The proxy will perform the following steps:
+This is a course demonstration, not a production proxy. It handles one request per client connection, does not implement persistent keep-alive, rejects chunked request bodies, does not implement full standards-compliant cache revalidation, and cannot inspect encrypted HTTPS traffic inside CONNECT tunnels. A thread is created per accepted client.
 
-Accept a client connection.
-Receive the HTTP request.
-Parse the request.
-Check access-control rules.
-Check whether the requested resource is available in the cache.
-If there is a valid cache entry, return the cached response.
-If there is no valid cache entry, connect to the destination server.
-Forward the client's request.
-Receive the destination server's response.
-Store suitable responses in the cache.
-Send the response back to the client.
-Record the request and result in the log.
-Technologies
-Programming Language: Python
-Protocol: HTTP
-Transport Protocol: TCP
-Networking: Python socket programming
-Concurrency: Thread-based client handling
-Caching: File-based cache
-Access Control: Domain/URL blocking
-Logging: File-based logging
-Version Control: Git and GitHub
+## Run and test
+
+```bash
+python proxy.py
+python -m unittest -v test_lru test_proxy
+python performance_test.py --url http://example.com/ --rounds 8 --clients 10
+```
+
+Use a destination you are permitted to test and report the actual benchmark output from your environment.
